@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-YouTube Downloader Bot (Webhook-ready)
-- Reacts ONLY to YouTube URLs (youtube.com / youtu.be)
-- Optional cookies support via YTDLP_COOKIES env (path to cookies.txt inside container)
-- Health endpoint on root (/) for platform checks
+YouTube Downloader Bot (Webhook-ready, Koyeb-ready)
+- Reacts ONLY to YouTube links (youtube.com / youtu.be)
+- Optional cookies support via env YTDLP_COOKIES (path to cookies.txt inside container)
+- Exposes health endpoint at /
 - Webhook path: /webhook/<BOT_TOKEN>
 """
 
@@ -19,19 +19,19 @@ from aiogram.types import InputFile
 from yt_dlp import YoutubeDL
 
 # ---------- Logging ----------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
 
 # ---------- Config ----------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-APP_URL = os.getenv("APP_URL")              # e.g. https://your-app-name.koyeb.app
+APP_URL = os.getenv("APP_URL")            # e.g. https://your-app-name.koyeb.app
 PORT = int(os.getenv("PORT", "8000"))
 YTDLP_COOKIES = os.getenv("YTDLP_COOKIES")  # e.g. /app/cookies.txt (optional)
 OWNER_ID = int(os.getenv("OWNER_ID") or 0)  # optional admin id
 
 if not BOT_TOKEN or not APP_URL:
-    logger.error("Missing BOT_TOKEN or APP_URL in environment.")
-    raise SystemExit("Please set BOT_TOKEN and APP_URL environment variables")
+    logger.error("BOT_TOKEN and APP_URL environment variables are required.")
+    raise SystemExit("Missing BOT_TOKEN or APP_URL")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -45,12 +45,8 @@ def build_ydl_opts():
         "quiet": True,
         "no_warnings": True,
     }
-    if YTDLP_COOKIES:
-        if os.path.exists(YTDLP_COOKIES):
-            opts["cookiefile"] = YTDLP_COOKIES
-            logger.info("Using cookies file for yt-dlp: %s", YTDLP_COOKIES)
-        else:
-            logger.warning("YTDLP_COOKIES set but file not found at: %s", YTDLP_COOKIES)
+    if YTDLP_COOKIES and os.path.exists(YTDLP_COOKIES):
+        opts["cookiefile"] = YTDLP_COOKIES
     return opts
 
 def human_size(bytesize: int) -> str:
@@ -73,7 +69,7 @@ async def cmd_start(message: types.Message):
     await message.reply(
         "👋 *YouTube Downloader*\n\n"
         "Send a YouTube video / short / playlist link and I'll download it for you.\n\n"
-        "If YouTube requests sign-in for some videos, upload a cookies.txt and set `YTDLP_COOKIES`.",
+        "If YouTube requests sign-in for some URLs, upload cookies.txt and set `YTDLP_COOKIES` in env.",
         parse_mode="Markdown"
     )
 
@@ -81,7 +77,7 @@ async def cmd_start(message: types.Message):
 async def cmd_help(message: types.Message):
     await message.reply("Send a YouTube link (video/short/playlist). Other links are ignored.")
 
-# ---------- Main message handler: ONLY respond to YouTube URLs ----------
+# ---------- Main handler: ONLY react to YouTube URLs ----------
 @dp.message()
 async def handle_message(message: types.Message):
     text = (message.text or "").strip()
@@ -96,7 +92,7 @@ async def handle_message(message: types.Message):
     url = text
     status = await message.reply("📥 Preparing to download...")
 
-    # probe first (to detect playlist or auth requirement)
+    # probe first (detect playlist or auth requirement)
     try:
         with YoutubeDL({"quiet": True, "no_warnings": True}) as ydl_probe:
             info = ydl_probe.extract_info(url, download=False)
@@ -105,7 +101,7 @@ async def handle_message(message: types.Message):
         logger.warning("Probe failed: %s", err)
         if "sign in" in err.lower() or "use --cookies" in err.lower() or "confirm you're not a bot" in err.lower():
             await status.edit_text(
-                "⚠️ This video requires YouTube sign-in. Admin must upload cookies.txt and set `YTDLP_COOKIES`."
+                "⚠️ This video requires YouTube sign-in. Admin must provide cookies.txt and set `YTDLP_COOKIES`."
             )
             if OWNER_ID:
                 try:
@@ -125,10 +121,10 @@ async def handle_message(message: types.Message):
             return filename, info_dict
 
     try:
-        # playlist
+        # playlist handling
         if info.get("_type") == "playlist" or info.get("entries"):
             entries = info.get("entries") or []
-            await status.edit_text(f"📋 Playlist detected: {len(entries)} items. Starting...")
+            await status.edit_text(f"📋 Playlist detected: {len(entries)} items. Starting downloads...")
             processed = 0
             for idx, entry in enumerate(entries, start=1):
                 entry_url = entry.get("webpage_url") or entry.get("url")
@@ -196,6 +192,17 @@ async def health(request):
     return web.Response(text="OK")
 
 async def on_startup(app):
+    # log cookies file details for debug (if present)
+    try:
+        if YTDLP_COOKIES and os.path.exists(YTDLP_COOKIES):
+            size = os.path.getsize(YTDLP_COOKIES)
+            lines = sum(1 for _ in open(YTDLP_COOKIES, "r", encoding="utf-8", errors="ignore"))
+            logger.info("Cookies file present: %s (bytes=%d lines=%d)", YTDLP_COOKIES, size, lines)
+        else:
+            logger.info("No cookies file found at configured path: %s", YTDLP_COOKIES)
+    except Exception as ex:
+        logger.warning("Error reading cookies file: %s", ex)
+
     webhook_url = f"{APP_URL}/webhook/{BOT_TOKEN}"
     try:
         await bot.set_webhook(webhook_url, drop_pending_updates=True)
@@ -218,13 +225,10 @@ async def on_shutdown(app):
 def run_app():
     app = web.Application()
     app.router.add_get("/", health)
-
     SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=f"/webhook/{BOT_TOKEN}")
     setup_application(app, dp, bot=bot)
-
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
-
     web.run_app(app, host="0.0.0.0", port=PORT)
 
 if __name__ == "__main__":
