@@ -1,15 +1,8 @@
-YouTube Downloader Telegram Bot
+#YouTube Downloader Telegram Bot (aiogram v3)
 
-Setup (Docker recommended):
-1. Copy files to repo root.
-2. Fill .env (or configure env vars in provider).
-3. git add/commit/push.
-4. Build & run:
+1) Fill env (do NOT commit .env to git)
+2) Build & run with Docker:
    docker build -t yt-tg-bot .
-   docker run --env-file .env yt-tg-bot
+   docker run --env-file .env -p 8000:8000 yt-tg-bot
 
-Local:
-1. python -m venv venv && source venv/bin/activate
-2. pip install -r requirements.txt
-3. export BOT_TOKEN=...; export MONGO_URL=...; export OWNER_ID=...
-4. python main.py
+3) Deploy on provider (set env BOT_TOKEN, MONGO_URL, OWNER_ID, PORT=8000)
