@@ -1,4 +1,4 @@
 aiogram==3.0.0b7
-yt-dlp==2025.10.8
+yt-dlp==2025.10.22
 motor==4.3.0
 python-dotenv==1.0.0
