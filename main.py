@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 YouTube Video / Shorts / Playlist Downloader Telegram Bot
-- aiogram v3 compatible (dp.start_polling)
+- aiogram v3 compatible (Dispatcher without bot in constructor)
 - yt-dlp for downloading
 - motor (Mongo) for user prefs
 - ffmpeg required for downscale/merge (installed in Dockerfile)
@@ -34,7 +34,7 @@ if not BOT_TOKEN or not MONGO_URL or not OWNER_ID:
     raise SystemExit("Missing environment variables")
 
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(bot)
+dp = Dispatcher()  # aiogram v3: do NOT pass bot into Dispatcher()
 
 mongo = AsyncIOMotorClient(MONGO_URL)
 db = mongo["yt_downloader"]
@@ -372,4 +372,5 @@ if __name__ == "__main__":
     logger.info("Starting bot...")
     if not is_ffmpeg_available():
         logger.warning("ffmpeg not found in PATH. Auto-downscale feature will not work. Install ffmpeg for full functionality.")
+    # aiogram v3: pass bot to start_polling
     asyncio.run(dp.start_polling(bot, skip_updates=True))
