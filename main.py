@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-YouTube Downloader Telegram Bot
+YouTube Video / Shorts / Playlist Downloader Telegram Bot
 - aiogram v3 compatible
-- Supports: video/short/playlist, per-user quality, auto downscale (>2GB) via ffmpeg
-- Uses yt-dlp and motor (Mongo)
+- Deletes webhook at startup to avoid webhook/polling conflict
+- Runs aiohttp health endpoint on PORT (default 8000) for provider health checks
+- Uses yt-dlp for downloads, ffmpeg for optional downscaling, motor for MongoDB
 """
 
 import os
@@ -13,28 +14,35 @@ import asyncio
 import shutil
 import subprocess
 from dotenv import load_dotenv
+from typing import Optional
 
 import yt_dlp
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import InputFile, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command
 from motor.motor_asyncio import AsyncIOMotorClient
+from aiohttp import web
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# ---- Config from env ----
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URL = os.getenv("MONGO_URL")
 OWNER_ID = int(os.getenv("OWNER_ID") or 0)
+PORT = int(os.getenv("PORT") or 8000)  # health check port
+MAX_TELEGRAM_BYTES = 2 * 1024 * 1024 * 1024  # 2GB
 
 if not BOT_TOKEN or not MONGO_URL or not OWNER_ID:
     logger.error("Please set BOT_TOKEN, MONGO_URL and OWNER_ID in environment.")
     raise SystemExit("Missing environment variables")
 
+# ---- Bot & Dispatcher ----
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()  # aiogram v3: no bot passed here
+dp = Dispatcher()
 
+# ---- DB ----
 mongo = AsyncIOMotorClient(MONGO_URL)
 db = mongo["yt_downloader"]
 users_col = db["users"]
@@ -106,13 +114,13 @@ def run_ffmpeg_transcode(input_path: str, output_path: str, target_height: int) 
     ]
     try:
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-        logger.info(f"ffmpeg exit code: {proc.returncode}")
+        logger.debug(proc.stderr.decode(errors="ignore"))
         return proc.returncode == 0 and os.path.exists(output_path)
     except Exception as e:
         logger.exception(f"ffmpeg run error: {e}")
         return False
 
-async def try_downscale_until_under_limit(original_path: str, title: str, max_bytes: int = 2 * 1024 * 1024 * 1024):
+async def try_downscale_until_under_limit(original_path: str, title: str, max_bytes: int = MAX_TELEGRAM_BYTES) -> Optional[str]:
     try:
         orig_size = os.path.getsize(original_path)
     except Exception as e:
@@ -230,11 +238,11 @@ async def cmd_broadcast(message: types.Message):
             pass
     await message.reply(f"✅ Broadcast sent to {sent}/{total} users.")
 
+# Core downloader message handler (catches other messages)
 @dp.message()
 async def handle_text(message: types.Message):
     if not message.text:
         return
-
     url = message.text.strip()
     if "youtube.com" not in url and "youtu.be" not in url:
         return await message.reply("❌ Please send a valid YouTube link (video / short / playlist).")
@@ -268,6 +276,7 @@ async def handle_text(message: types.Message):
             return filename, info_dict
 
     try:
+        # Playlist support
         if info.get("_type") == "playlist" or info.get("entries"):
             entries = info.get("entries") or []
             await status.edit_text(f"📋 Playlist detected. Videos: {len(entries)}. Starting downloads...")
@@ -297,6 +306,7 @@ async def handle_text(message: types.Message):
             await status.edit_text(f"✅ Playlist done. {count} videos processed.")
             return
 
+        # Single video
         await status.edit_text("📥 Single video detected. Downloading...")
         try:
             filename, info_dict = await asyncio.get_event_loop().run_in_executor(
@@ -308,12 +318,15 @@ async def handle_text(message: types.Message):
             return
 
         await process_and_send_file(message, filename, info_dict)
-        await status.delete()
+        try:
+            await status.delete()
+        except:
+            pass
     except Exception as e:
         logger.exception("Processing error")
         await status.edit_text(f"❌ Error while processing: {e}")
 
-# ---------- send file ----------
+# send file helper
 async def process_and_send_file(message: types.Message, filepath: str, info: dict):
     filepath_to_send = filepath
     try:
@@ -323,22 +336,24 @@ async def process_and_send_file(message: types.Message, filepath: str, info: dic
 
         size = os.path.getsize(filepath)
         title = info.get("title") or os.path.basename(filepath)
-        max_bytes = 2 * 1024 * 1024 * 1024  # 2GB
 
-        if size > max_bytes:
-            await message.reply(f"⚠️ *{title}* is {round(size/1024/1024,2)} MB which is above Telegram's 2GB limit. Attempting to auto-downscale...", parse_mode="Markdown")
-            downscaled = await try_downscale_until_under_limit(filepath, title, max_bytes=max_bytes)
+        if size > MAX_TELEGRAM_BYTES:
+            await message.reply(
+                f"⚠️ *{title}* is {round(size/1024/1024,2)} MB which is above Telegram's 2GB limit. Attempting to auto-downscale...",
+                parse_mode="Markdown",
+            )
+            downscaled = await try_downscale_until_under_limit(filepath, title, max_bytes=MAX_TELEGRAM_BYTES)
             if downscaled:
                 filepath_to_send = downscaled
             else:
-                await message.reply(f"❌ Could not reduce *{title}* below 2GB. Please try lower /setquality or host externally.", parse_mode="Markdown")
+                await message.reply(f"❌ Could not reduce *{title}* below 2GB. Try lower /setquality or host externally.", parse_mode="Markdown")
                 await cleanup_file(filepath)
                 return
         else:
             filepath_to_send = filepath
 
         final_size = os.path.getsize(filepath_to_send)
-        if final_size > max_bytes:
+        if final_size > MAX_TELEGRAM_BYTES:
             await message.reply(f"⚠️ File is still too large ({round(final_size/1024/1024,2)} MB). Cannot send via Telegram.", parse_mode="Markdown")
             await cleanup_file(filepath_to_send)
             return
@@ -364,9 +379,44 @@ async def process_and_send_file(message: types.Message, filepath: str, info: dic
         except Exception:
             pass
 
-# ---------- Start ----------
+# ---------- Health server ----------
+async def handle_health(request):
+    return web.Response(text="OK")
+
+async def start_health_server(shutdown_event: asyncio.Event):
+    app = web.Application()
+    app.router.add_get("/", handle_health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    logger.info(f"Health server listening on 0.0.0.0:{PORT}")
+    await shutdown_event.wait()
+    logger.info("Health server shutting down...")
+    await runner.cleanup()
+
+# ---------- Main startup (delete webhook + start polling + health) ----------
+async def main():
+    # try delete webhook to avoid webhook vs polling conflict
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+        logger.info("delete_webhook called successfully at startup.")
+    except Exception as e:
+        logger.warning(f"delete_webhook failed or not supported: {e}")
+
+    shutdown_event = asyncio.Event()
+    health_task = asyncio.create_task(start_health_server(shutdown_event))
+
+    try:
+        logger.info("Starting polling...")
+        await dp.start_polling(bot, skip_updates=True)
+    finally:
+        # stop health server when polling ends
+        shutdown_event.set()
+        await health_task
+
 if __name__ == "__main__":
-    logger.info("Starting bot...")
-    if not is_ffmpeg_available():
-        logger.warning("ffmpeg not found in PATH. Auto-downscale feature will not work.")
-    asyncio.run(dp.start_polling(bot, skip_updates=True))
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Exiting")
