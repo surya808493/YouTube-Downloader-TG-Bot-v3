@@ -2,15 +2,11 @@
 # -*- coding: utf-8 -*-
 """
 YouTube Video / Shorts / Playlist Downloader Telegram Bot
-Features:
-- /start, /help, /setquality (360/480/720/1080/Best)
-- Downloads via yt-dlp according to user quality preference
-- Playlist support: downloads each video and sends separately
-- MongoDB (motor) used to store users and their quality preference
-- /stats and /broadcast for OWNER only
-- 2GB Telegram file size check
-- Auto-downscale (ffmpeg) if file > 2GB (tries 1080->720->480->360->240)
-Compatible with aiogram v3 (uses dp.start_polling)
+- aiogram v3 compatible (dp.start_polling)
+- yt-dlp for downloading
+- motor (Mongo) for user prefs
+- ffmpeg required for downscale/merge (installed in Dockerfile)
+- /setquality, /stats, /broadcast, playlist support, auto-downscale if >2GB
 """
 
 import os
@@ -38,13 +34,13 @@ if not BOT_TOKEN or not MONGO_URL or not OWNER_ID:
     raise SystemExit("Missing environment variables")
 
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(bot)  # works with aiogram v3 in this project style
+dp = Dispatcher(bot)
 
 mongo = AsyncIOMotorClient(MONGO_URL)
 db = mongo["yt_downloader"]
 users_col = db["users"]
 
-# ---------- Helpers: DB ----------
+# ---------- DB helpers ----------
 async def add_user(user_id: int):
     doc = await users_col.find_one({"user_id": user_id})
     if not doc:
@@ -62,7 +58,7 @@ async def get_user_quality(user_id: int) -> str:
 async def count_users() -> int:
     return await users_col.count_documents({})
 
-# ---------- Keyboards ----------
+# ---------- UI ----------
 def quality_keyboard():
     kb = InlineKeyboardMarkup(row_width=3)
     kb.add(
@@ -97,10 +93,6 @@ def is_ffmpeg_available() -> bool:
     return shutil.which("ffmpeg") is not None
 
 def run_ffmpeg_transcode(input_path: str, output_path: str, target_height: int) -> bool:
-    """
-    Re-encode input_path to output_path with target_height.
-    Returns True if ffmpeg succeeded (exit code 0); False otherwise.
-    """
     cmd = [
         "ffmpeg",
         "-y",
@@ -127,10 +119,6 @@ def run_ffmpeg_transcode(input_path: str, output_path: str, target_height: int) 
         return False
 
 async def try_downscale_until_under_limit(original_path: str, title: str, max_bytes: int = 2 * 1024 * 1024 * 1024):
-    """
-    Attempt progressive downscales until file <= max_bytes or targets exhausted.
-    Returns path to successful file (original removed), or None if failed.
-    """
     try:
         orig_size = os.path.getsize(original_path)
     except Exception as e:
@@ -179,7 +167,7 @@ async def try_downscale_until_under_limit(original_path: str, title: str, max_by
             continue
     return None
 
-# ---------- Handlers (aiogram decorator style kept from earlier code) ----------
+# ---------- Handlers ----------
 @dp.message_handler(commands=["start"])
 async def cmd_start(message: types.Message):
     await add_user(message.from_user.id)
@@ -248,7 +236,7 @@ async def cmd_broadcast(message: types.Message):
             pass
     await message.reply(f"✅ Broadcast sent to {sent}/{total} users.")
 
-# ---------- Core downloader handler ----------
+# ---------- Core downloader ----------
 @dp.message_handler(content_types=["text"])
 async def handle_text(message: types.Message):
     url = message.text.strip()
@@ -330,10 +318,7 @@ async def handle_text(message: types.Message):
         await status.edit_text(f"❌ Error while processing: {e}")
 
 async def process_and_send_file(message: types.Message, filepath: str, info: dict):
-    """
-    Handles size checks, auto-downscale if needed, send file, cleanup.
-    """
-    filepath_to_send = filepath  # default
+    filepath_to_send = filepath
     try:
         if not os.path.exists(filepath):
             await message.reply("❌ Downloaded file not found.")
@@ -382,10 +367,9 @@ async def process_and_send_file(message: types.Message, filepath: str, info: dic
         except Exception:
             pass
 
-# ---------- Startup ----------
+# ---------- Start ----------
 if __name__ == "__main__":
     logger.info("Starting bot...")
     if not is_ffmpeg_available():
         logger.warning("ffmpeg not found in PATH. Auto-downscale feature will not work. Install ffmpeg for full functionality.")
-    # start polling (aiogram v3 compatible)
     asyncio.run(dp.start_polling(bot, skip_updates=True))
