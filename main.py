@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-YouTube Downloader Bot (Webhook-ready, Koyeb-ready)
-- Reacts ONLY to YouTube links (youtube.com / youtu.be)
-- Optional cookies support via env YTDLP_COOKIES (path to cookies.txt inside container)
-- Exposes health endpoint at /
-- Webhook path: /webhook/<BOT_TOKEN>
+YouTube Downloader Bot (Webhook-ready, Koyeb-friendly)
+- Writes COOKIES_FILE secret into YTDLP_COOKIES path at startup (if provided)
+- Uses YTDLP_COOKIES (/app/cookies.txt default) for yt-dlp
+- Retries webhook set with timeout to avoid transient network errors
+- Reacts ONLY to YouTube links
 """
 
 import os
 import logging
 import asyncio
+import time
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
@@ -22,12 +23,15 @@ from yt_dlp import YoutubeDL
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
 
-# ---------- Config ----------
+# ---------- Config (env) ----------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-APP_URL = os.getenv("APP_URL")            # e.g. https://your-app-name.koyeb.app
+APP_URL = os.getenv("APP_URL")            # required
 PORT = int(os.getenv("PORT", "8000"))
-YTDLP_COOKIES = os.getenv("YTDLP_COOKIES")  # e.g. /app/cookies.txt (optional)
-OWNER_ID = int(os.getenv("OWNER_ID") or 0)  # optional admin id
+# path where main.py will look for cookies; default to /app/cookies.txt
+YTDLP_COOKIES = os.getenv("YTDLP_COOKIES", "/app/cookies.txt")
+# secret content name (optional). If set, main.py will write it into YTDLP_COOKIES
+COOKIES_FILE_SECRET = os.getenv("COOKIES_FILE")   # large text secret (cookie file contents)
+OWNER_ID = int(os.getenv("OWNER_ID") or 0)
 
 if not BOT_TOKEN or not APP_URL:
     logger.error("BOT_TOKEN and APP_URL environment variables are required.")
@@ -36,7 +40,14 @@ if not BOT_TOKEN or not APP_URL:
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# ---------- Helpers ----------
+# ---------- Utility functions ----------
+def write_secret_to_file(secret_text: str, path: str) -> None:
+    """Write secret content to path (atomic write)."""
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8", errors="ignore") as f:
+        f.write(secret_text)
+    os.replace(tmp, path)
+
 def build_ydl_opts():
     opts = {
         "format": "bestvideo+bestaudio/best",
@@ -63,13 +74,11 @@ async def safe_remove(path: str):
     except Exception:
         pass
 
-# ---------- Commands ----------
+# ---------- Bot commands ----------
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await message.reply(
-        "👋 *YouTube Downloader*\n\n"
-        "Send a YouTube video / short / playlist link and I'll download it for you.\n\n"
-        "If YouTube requests sign-in for some URLs, upload cookies.txt and set `YTDLP_COOKIES` in env.",
+        "👋 *YouTube Downloader*\nSend a YouTube video/short/playlist link.\nAdmin: set `COOKIES_FILE` secret and `YTDLP_COOKIES=/app/cookies.txt` if sign-in required.",
         parse_mode="Markdown"
     )
 
@@ -77,22 +86,21 @@ async def cmd_start(message: types.Message):
 async def cmd_help(message: types.Message):
     await message.reply("Send a YouTube link (video/short/playlist). Other links are ignored.")
 
-# ---------- Main handler: ONLY react to YouTube URLs ----------
+# ---------- Main handler (ONLY YouTube URLs) ----------
 @dp.message()
 async def handle_message(message: types.Message):
     text = (message.text or "").strip()
     if not text:
         return
-
-    # Ignore non-YouTube messages silently
     if ("youtube.com" not in text) and ("youtu.be" not in text):
-        logger.debug("Ignored non-YouTube message from %s", message.from_user.id)
+        # silently ignore other links as requested
+        logger.debug("Ignored non-YouTube message from user=%s", message.from_user.id)
         return
 
     url = text
     status = await message.reply("📥 Preparing to download...")
 
-    # probe first (detect playlist or auth requirement)
+    # Probe first
     try:
         with YoutubeDL({"quiet": True, "no_warnings": True}) as ydl_probe:
             info = ydl_probe.extract_info(url, download=False)
@@ -101,7 +109,7 @@ async def handle_message(message: types.Message):
         logger.warning("Probe failed: %s", err)
         if "sign in" in err.lower() or "use --cookies" in err.lower() or "confirm you're not a bot" in err.lower():
             await status.edit_text(
-                "⚠️ This video requires YouTube sign-in. Admin must provide cookies.txt and set `YTDLP_COOKIES`."
+                "⚠️ This video requires YouTube sign-in. Admin must provide cookies (set COOKIES_FILE secret and YTDLP_COOKIES=/app/cookies.txt)."
             )
             if OWNER_ID:
                 try:
@@ -121,10 +129,10 @@ async def handle_message(message: types.Message):
             return filename, info_dict
 
     try:
-        # playlist handling
+        # playlist
         if info.get("_type") == "playlist" or info.get("entries"):
             entries = info.get("entries") or []
-            await status.edit_text(f"📋 Playlist detected: {len(entries)} items. Starting downloads...")
+            await status.edit_text(f"📋 Playlist detected: {len(entries)} items. Starting...")
             processed = 0
             for idx, entry in enumerate(entries, start=1):
                 entry_url = entry.get("webpage_url") or entry.get("url")
@@ -162,7 +170,7 @@ async def handle_message(message: types.Message):
         logger.exception("Download error")
         if "sign in" in err.lower() or "use --cookies" in err.lower():
             await status.edit_text(
-                "⚠️ Download blocked: YouTube requests sign-in. Admin: provide cookies.txt and set `YTDLP_COOKIES`."
+                "⚠️ Download blocked: YouTube requests sign-in. Admin: provide cookies and set YTDLP_COOKIES."
             )
             if OWNER_ID:
                 try:
@@ -187,33 +195,55 @@ async def send_file_and_cleanup(message: types.Message, filepath: str, info: dic
     finally:
         await safe_remove(filepath)
 
-# ---------- Health endpoint & webhook setup ----------
+# ---------- Health and startup ----------
 async def health(request):
     return web.Response(text="OK")
 
+async def set_webhook_with_retries(webhook_url: str, tries: int = 5, delay: int = 3):
+    """Try to set webhook with retries and increasing timeout."""
+    for attempt in range(1, tries + 1):
+        try:
+            # use a longer timeout for Telegram network calls
+            await bot.set_webhook(webhook_url, drop_pending_updates=True, request_timeout=30)
+            logger.info("Webhook set -> %s", webhook_url)
+            return True
+        except Exception as ex:
+            logger.warning("Attempt %d: Failed to set webhook: %s", attempt, ex)
+            if attempt < tries:
+                await asyncio.sleep(delay * attempt)
+    return False
+
 async def on_startup(app):
-    # log cookies file details for debug (if present)
+    # If secret COOKIES_FILE present, write it to YTDLP_COOKIES
     try:
-        if YTDLP_COOKIES and os.path.exists(YTDLP_COOKIES):
-            size = os.path.getsize(YTDLP_COOKIES)
-            lines = sum(1 for _ in open(YTDLP_COOKIES, "r", encoding="utf-8", errors="ignore"))
-            logger.info("Cookies file present: %s (bytes=%d lines=%d)", YTDLP_COOKIES, size, lines)
+        if COOKIES_FILE_SECRET and isinstance(COOKIES_FILE_SECRET, str) and COOKIES_FILE_SECRET.strip():
+            try:
+                write_secret_to_file(COOKIES_FILE_SECRET, YTDLP_COOKIES)
+                size = os.path.getsize(YTDLP_COOKIES)
+                lines = sum(1 for _ in open(YTDLP_COOKIES, "r", encoding="utf-8", errors="ignore"))
+                logger.info("Wrote COOKIES_FILE secret -> %s (bytes=%d lines=%d)", YTDLP_COOKIES, size, lines)
+            except Exception as e:
+                logger.exception("Failed to write COOKIES_FILE to %s: %s", YTDLP_COOKIES, e)
         else:
-            logger.info("No cookies file found at configured path: %s", YTDLP_COOKIES)
-    except Exception as ex:
-        logger.warning("Error reading cookies file: %s", ex)
+            if os.path.exists(YTDLP_COOKIES):
+                size = os.path.getsize(YTDLP_COOKIES)
+                lines = sum(1 for _ in open(YTDLP_COOKIES, "r", encoding="utf-8", errors="ignore"))
+                logger.info("Cookies file present at startup: %s (bytes=%d lines=%d)", YTDLP_COOKIES, size, lines)
+            else:
+                logger.info("No cookies file found at configured path: %s", YTDLP_COOKIES)
+    except Exception as e:
+        logger.exception("Error checking/writing cookies file: %s", e)
 
     webhook_url = f"{APP_URL}/webhook/{BOT_TOKEN}"
-    try:
-        await bot.set_webhook(webhook_url, drop_pending_updates=True)
-        logger.info("Webhook set -> %s", webhook_url)
+    ok = await set_webhook_with_retries(webhook_url, tries=5, delay=3)
+    if not ok:
+        logger.error("Failed to set webhook after retries. Continuing without webhook set (check network).")
+    else:
         if OWNER_ID:
             try:
                 await bot.send_message(OWNER_ID, f"✅ Bot started. Webhook set: {webhook_url}")
             except Exception:
                 pass
-    except Exception as e:
-        logger.exception("Failed to set webhook: %s", e)
 
 async def on_shutdown(app):
     try:
