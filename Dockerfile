@@ -1,10 +1,8 @@
-# Use Python 3.11 slim to maximize compatibility with native wheels (aiohttp etc.)
 FROM python:3.11-slim
 
 LABEL maintainer="you@example.com"
 ENV PYTHONUNBUFFERED=1
 
-# Install ffmpeg + build tools (needed for some wheels if pip falls back to source)
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
        ffmpeg \
@@ -18,22 +16,21 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-
-# Copy requirements early to cache
 COPY requirements.txt /app/requirements.txt
 
 RUN pip install --upgrade pip setuptools wheel \
     && pip install --no-cache-dir -r /app/requirements.txt
 
-# Copy application
 COPY . /app
-
 RUN chmod +x /app/main.py || true
 
-# Create non-root user
+# create non-root user
 RUN useradd --create-home botuser || true
 USER botuser
 WORKDIR /home/botuser/app
 COPY --chown=botuser:botuser . /home/botuser/app
+
+# expose health port (optional)
+EXPOSE 8000
 
 CMD ["python", "main.py"]
