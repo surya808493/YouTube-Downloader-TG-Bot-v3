@@ -1,11 +1,10 @@
-# Use official Python image
-FROM python:3.13-slim
+# Use Python 3.12 slim to ensure wheels for native deps (aiohttp) are available
+FROM python:3.12-slim
 
 LABEL maintainer="you@example.com"
-
 ENV PYTHONUNBUFFERED=1
 
-# Install ffmpeg and build deps required to compile wheels (aiohttp, etc.)
+# Install ffmpeg + build tools (needed for some wheels)
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
        ffmpeg \
@@ -20,10 +19,9 @@ RUN apt-get update \
 
 WORKDIR /app
 
-# Copy requirements first for better layer caching
+# Copy requirements early to cache
 COPY requirements.txt /app/requirements.txt
 
-# Upgrade pip/setuptools and install Python deps
 RUN pip install --upgrade pip setuptools wheel \
     && pip install --no-cache-dir -r /app/requirements.txt
 
@@ -32,7 +30,7 @@ COPY . /app
 
 RUN chmod +x /app/main.py || true
 
-# Create non-root user and change ownership
+# Create non-root user
 RUN useradd --create-home botuser || true
 USER botuser
 WORKDIR /home/botuser/app
