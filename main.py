@@ -10,6 +10,7 @@ Features:
 - /stats and /broadcast for OWNER only
 - 2GB Telegram file size check
 - Auto-downscale (ffmpeg) if file > 2GB (tries 1080->720->480->360->240)
+Compatible with aiogram v3 (uses dp.start_polling)
 """
 
 import os
@@ -22,7 +23,6 @@ from dotenv import load_dotenv
 import yt_dlp
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import InputFile, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.utils import executor
 from motor.motor_asyncio import AsyncIOMotorClient
 
 load_dotenv()
@@ -38,7 +38,8 @@ if not BOT_TOKEN or not MONGO_URL or not OWNER_ID:
     raise SystemExit("Missing environment variables")
 
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(bot)
+dp = Dispatcher(bot)  # works with aiogram v3 in this project style
+
 mongo = AsyncIOMotorClient(MONGO_URL)
 db = mongo["yt_downloader"]
 users_col = db["users"]
@@ -178,7 +179,7 @@ async def try_downscale_until_under_limit(original_path: str, title: str, max_by
             continue
     return None
 
-# ---------- Command handlers ----------
+# ---------- Handlers (aiogram decorator style kept from earlier code) ----------
 @dp.message_handler(commands=["start"])
 async def cmd_start(message: types.Message):
     await add_user(message.from_user.id)
@@ -386,4 +387,5 @@ if __name__ == "__main__":
     logger.info("Starting bot...")
     if not is_ffmpeg_available():
         logger.warning("ffmpeg not found in PATH. Auto-downscale feature will not work. Install ffmpeg for full functionality.")
-    executor.start_polling(dp, skip_updates=True)
+    # start polling (aiogram v3 compatible)
+    asyncio.run(dp.start_polling(bot, skip_updates=True))
