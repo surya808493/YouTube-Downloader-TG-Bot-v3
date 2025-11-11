@@ -1,422 +1,96 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-YouTube Video / Shorts / Playlist Downloader Telegram Bot
-- aiogram v3 compatible
-- Deletes webhook at startup to avoid webhook/polling conflict
-- Runs aiohttp health endpoint on PORT (default 8000) for provider health checks
-- Uses yt-dlp for downloads, ffmpeg for optional downscaling, motor for MongoDB
-"""
-
 import os
-import logging
 import asyncio
-import shutil
-import subprocess
-from dotenv import load_dotenv
-from typing import Optional
-
-import yt_dlp
+import logging
 from aiogram import Bot, Dispatcher, types
-from aiogram.types import InputFile, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command
-from motor.motor_asyncio import AsyncIOMotorClient
+from aiogram.types import InputFile
+from yt_dlp import YoutubeDL
 from aiohttp import web
 
-load_dotenv()
+# Logging setup
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---- Config from env ----
+# Env setup
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-MONGO_URL = os.getenv("MONGO_URL")
-OWNER_ID = int(os.getenv("OWNER_ID") or 0)
-PORT = int(os.getenv("PORT") or 8000)  # health check port
-MAX_TELEGRAM_BYTES = 2 * 1024 * 1024 * 1024  # 2GB
+PORT = int(os.getenv("PORT", "8000"))
+if not BOT_TOKEN:
+    raise ValueError("❌ BOT_TOKEN is missing!")
 
-if not BOT_TOKEN or not MONGO_URL or not OWNER_ID:
-    logger.error("Please set BOT_TOKEN, MONGO_URL and OWNER_ID in environment.")
-    raise SystemExit("Missing environment variables")
-
-# ---- Bot & Dispatcher ----
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# ---- DB ----
-mongo = AsyncIOMotorClient(MONGO_URL)
-db = mongo["yt_downloader"]
-users_col = db["users"]
 
-# ---------- DB helpers ----------
-async def add_user(user_id: int):
-    doc = await users_col.find_one({"user_id": user_id})
-    if not doc:
-        await users_col.insert_one({"user_id": user_id, "quality": "best"})
-
-async def set_user_quality(user_id: int, quality: str):
-    await users_col.update_one({"user_id": user_id}, {"$set": {"quality": quality}}, upsert=True)
-
-async def get_user_quality(user_id: int) -> str:
-    doc = await users_col.find_one({"user_id": user_id})
-    if doc and doc.get("quality"):
-        return doc["quality"]
-    return "best"
-
-async def count_users() -> int:
-    return await users_col.count_documents({})
-
-# ---------- UI ----------
-def quality_keyboard():
-    kb = InlineKeyboardMarkup(row_width=3)
-    kb.add(
-        InlineKeyboardButton("360p", callback_data="quality_360"),
-        InlineKeyboardButton("480p", callback_data="quality_480"),
-        InlineKeyboardButton("720p", callback_data="quality_720"),
-        InlineKeyboardButton("1080p", callback_data="quality_1080"),
-        InlineKeyboardButton("Best", callback_data="quality_best"),
-    )
-    return kb
-
-# ---------- Utilities ----------
-def ytdlp_format_for_quality(quality: str) -> str:
-    if quality == "best":
-        return "bestvideo+bestaudio/best"
-    try:
-        h = int(quality)
-        if h <= 0:
-            return "bestvideo+bestaudio/best"
-        return f"bestvideo[height<={h}]+bestaudio/best[height<={h}]"
-    except Exception:
-        return "bestvideo+bestaudio/best"
-
-async def cleanup_file(path: str):
-    try:
-        if os.path.exists(path):
-            os.remove(path)
-    except Exception as e:
-        logger.warning(f"Failed to remove file {path}: {e}")
-
-def is_ffmpeg_available() -> bool:
-    return shutil.which("ffmpeg") is not None
-
-def run_ffmpeg_transcode(input_path: str, output_path: str, target_height: int) -> bool:
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-i", input_path,
-        "-vf", f"scale=-2:{target_height}",
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", "24",
-        "-c:a", "aac",
-        "-b:a", "128k",
-        output_path
-    ]
-    try:
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-        logger.debug(proc.stderr.decode(errors="ignore"))
-        return proc.returncode == 0 and os.path.exists(output_path)
-    except Exception as e:
-        logger.exception(f"ffmpeg run error: {e}")
-        return False
-
-async def try_downscale_until_under_limit(original_path: str, title: str, max_bytes: int = MAX_TELEGRAM_BYTES) -> Optional[str]:
-    try:
-        orig_size = os.path.getsize(original_path)
-    except Exception as e:
-        logger.warning(f"Could not stat {original_path}: {e}")
-        return None
-
-    if orig_size <= max_bytes:
-        return original_path
-
-    if not is_ffmpeg_available():
-        logger.warning("ffmpeg not available for downscale")
-        return None
-
-    targets = [1080, 720, 480, 360, 240]
-    base_dir = os.path.dirname(original_path) or "."
-    name_no_ext = os.path.splitext(os.path.basename(original_path))[0]
-
-    for h in targets:
-        tmp_out = os.path.join(base_dir, f"{name_no_ext}_down_{h}.mp4")
-        logger.info(f"Attempting transcode to {h}p -> {tmp_out}")
-        success = run_ffmpeg_transcode(original_path, tmp_out, h)
-        if not success:
-            if os.path.exists(tmp_out):
-                try:
-                    os.remove(tmp_out)
-                except:
-                    pass
-            continue
-        try:
-            new_size = os.path.getsize(tmp_out)
-        except:
-            new_size = None
-        logger.info(f"Result size after {h}p: {new_size}")
-        if new_size is not None and new_size <= max_bytes:
-            try:
-                os.remove(original_path)
-            except:
-                pass
-            return tmp_out
-        else:
-            if os.path.exists(tmp_out):
-                try:
-                    os.remove(tmp_out)
-                except:
-                    pass
-            continue
-    return None
-
-# ---------- Handlers ----------
+# ------------------- Command Handlers -------------------
 @dp.message(Command("start"))
-async def cmd_start(message: types.Message):
-    await add_user(message.from_user.id)
-    txt = (
-        "🎬 *YouTube Downloader Bot*\n\n"
-        "Send any YouTube link (video / short / playlist) and I'll download it.\n\n"
-        "Commands:\n"
-        "/setquality - Choose download quality (360/480/720/1080/Best)\n"
-        "/help - Show help\n"
-        "/stats - Owner only\n"
-        "/broadcast - Owner only (reply to a message)\n\n"
-        "Note: If a downloaded file > 2GB, I'll try to auto-downscale (ffmpeg) to fit Telegram's 2GB limit."
+async def start_cmd(msg: types.Message):
+    await msg.answer(
+        "👋 *Welcome to YouTube Downloader Bot!*\n\n"
+        "Send any YouTube video, short, or playlist link to download it.",
+        parse_mode="Markdown",
     )
-    await message.reply(txt, parse_mode="Markdown")
 
-@dp.message(Command("help"))
-async def cmd_help(message: types.Message):
-    txt = (
-        "📚 *Help*\n\n"
-        "• Send a YouTube link (video / short / playlist).\n"
-        "• Use /setquality to set your preferred quality.\n"
-        "• Playlist videos are sent one-by-one.\n"
-        "• Files larger than 2GB: bot will attempt to downscale automatically (requires ffmpeg).\n"
-    )
-    await message.reply(txt, parse_mode="Markdown")
 
-@dp.message(Command("setquality"))
-async def cmd_setquality(message: types.Message):
-    await add_user(message.from_user.id)
-    current = await get_user_quality(message.from_user.id)
-    await message.reply(f"Select quality (current: {current})", reply_markup=quality_keyboard())
-
-@dp.callback_query(lambda c: c.data and c.data.startswith("quality_"))
-async def callback_quality(query: types.CallbackQuery):
-    user_id = query.from_user.id
-    await add_user(user_id)
-    quality = query.data.split("_", 1)[1]
-    await set_user_quality(user_id, quality)
-    await query.answer(f"Quality set to {quality}", show_alert=False)
-    await bot.send_message(user_id, f"✅ Your preferred quality is now *{quality}*", parse_mode="Markdown")
-
-@dp.message(Command("stats"))
-async def cmd_stats(message: types.Message):
-    if message.from_user.id != OWNER_ID:
-        return await message.reply("❌ You are not authorized.")
-    total = await count_users()
-    await message.reply(f"📊 Total users: `{total}`", parse_mode="Markdown")
-
-@dp.message(Command("broadcast"))
-async def cmd_broadcast(message: types.Message):
-    if message.from_user.id != OWNER_ID:
-        return await message.reply("❌ You are not authorized.")
-    if not message.reply_to_message:
-        return await message.reply("Reply to a message (text) that you want to broadcast.")
-    body = message.reply_to_message.text or message.reply_to_message.caption or ""
-    if not body:
-        return await message.reply("Reply to a text message to broadcast.")
-    sent = 0
-    total = await count_users()
-    async for u in users_col.find({}):
-        uid = u.get("user_id")
-        try:
-            await bot.send_message(uid, body)
-            sent += 1
-        except Exception:
-            pass
-    await message.reply(f"✅ Broadcast sent to {sent}/{total} users.")
-
-# Core downloader message handler (catches other messages)
+# ------------------- Download Handler -------------------
 @dp.message()
-async def handle_text(message: types.Message):
-    if not message.text:
-        return
-    url = message.text.strip()
-    if "youtube.com" not in url and "youtu.be" not in url:
-        return await message.reply("❌ Please send a valid YouTube link (video / short / playlist).")
+async def downloader(msg: types.Message):
+    url = msg.text.strip()
+    if not ("youtube.com" in url or "youtu.be" in url):
+        return await msg.reply("❌ Please send a valid YouTube link!")
 
-    await add_user(message.from_user.id)
-    user_quality = await get_user_quality(message.from_user.id)
-    fmt = ytdlp_format_for_quality(user_quality)
-
-    status = await message.reply("📥 Downloading... Please wait (playlist may take long).")
-
-    ydl_opts_common = {
-        "outtmpl": "%(title)s.%(ext)s",
-        "format": fmt,
-        "merge_output_format": "mp4",
-        "quiet": True,
-        "no_warnings": True,
-    }
+    status = await msg.reply("📥 Downloading your video... Please wait!")
 
     try:
-        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl_probe:
-            info = ydl_probe.extract_info(url, download=False)
+        ydl_opts = {
+            "format": "bestvideo+bestaudio/best",
+            "outtmpl": "%(title)s.%(ext)s",
+            "quiet": True,
+            "merge_output_format": "mp4",
+        }
+
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            filename = ydl.prepare_filename(info)
+
+        await msg.reply_video(InputFile(filename), caption=f"🎬 {info.get('title', 'Downloaded Video')}")
+        os.remove(filename)
+        await status.delete()
+
     except Exception as e:
-        logger.exception("Probe failed")
-        await status.edit_text(f"❌ Failed to read link: {e}")
-        return
+        await status.edit_text(f"❌ Error: {e}")
+        logger.error(f"Download error: {e}")
 
-    def download_single(video_url: str, opts: dict):
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info_dict = ydl.extract_info(video_url, download=True)
-            filename = ydl.prepare_filename(info_dict)
-            return filename, info_dict
 
-    try:
-        # Playlist support
-        if info.get("_type") == "playlist" or info.get("entries"):
-            entries = info.get("entries") or []
-            await status.edit_text(f"📋 Playlist detected. Videos: {len(entries)}. Starting downloads...")
-            count = 0
-            for entry in entries:
-                entry_url = entry.get("webpage_url") or entry.get("url")
-                if not entry_url:
-                    video_id = entry.get("id")
-                    if video_id:
-                        entry_url = f"https://www.youtube.com/watch?v={video_id}"
-                if not entry_url:
-                    continue
-
-                await status.edit_text(f"📥 Downloading ({count+1}/{len(entries)}): {entry.get('title') or entry_url}")
-                try:
-                    filename, info_dict = await asyncio.get_event_loop().run_in_executor(
-                        None, download_single, entry_url, ydl_opts_common
-                    )
-                except Exception as e:
-                    logger.exception(f"Failed to download entry {entry_url}")
-                    await message.reply(f"⚠️ Failed to download an entry: {e}")
-                    continue
-
-                await process_and_send_file(message, filename, info_dict)
-                count += 1
-
-            await status.edit_text(f"✅ Playlist done. {count} videos processed.")
-            return
-
-        # Single video
-        await status.edit_text("📥 Single video detected. Downloading...")
-        try:
-            filename, info_dict = await asyncio.get_event_loop().run_in_executor(
-                None, download_single, url, ydl_opts_common
-            )
-        except Exception as e:
-            logger.exception("Download failed")
-            await status.edit_text(f"❌ Download failed: {e}")
-            return
-
-        await process_and_send_file(message, filename, info_dict)
-        try:
-            await status.delete()
-        except:
-            pass
-    except Exception as e:
-        logger.exception("Processing error")
-        await status.edit_text(f"❌ Error while processing: {e}")
-
-# send file helper
-async def process_and_send_file(message: types.Message, filepath: str, info: dict):
-    filepath_to_send = filepath
-    try:
-        if not os.path.exists(filepath):
-            await message.reply("❌ Downloaded file not found.")
-            return
-
-        size = os.path.getsize(filepath)
-        title = info.get("title") or os.path.basename(filepath)
-
-        if size > MAX_TELEGRAM_BYTES:
-            await message.reply(
-                f"⚠️ *{title}* is {round(size/1024/1024,2)} MB which is above Telegram's 2GB limit. Attempting to auto-downscale...",
-                parse_mode="Markdown",
-            )
-            downscaled = await try_downscale_until_under_limit(filepath, title, max_bytes=MAX_TELEGRAM_BYTES)
-            if downscaled:
-                filepath_to_send = downscaled
-            else:
-                await message.reply(f"❌ Could not reduce *{title}* below 2GB. Try lower /setquality or host externally.", parse_mode="Markdown")
-                await cleanup_file(filepath)
-                return
-        else:
-            filepath_to_send = filepath
-
-        final_size = os.path.getsize(filepath_to_send)
-        if final_size > MAX_TELEGRAM_BYTES:
-            await message.reply(f"⚠️ File is still too large ({round(final_size/1024/1024,2)} MB). Cannot send via Telegram.", parse_mode="Markdown")
-            await cleanup_file(filepath_to_send)
-            return
-
-        ext = os.path.splitext(filepath_to_send)[1].lower()
-        caption = f"🎬 {title}"
-        try:
-            if ext in [".mp4", ".mkv", ".webm", ".mov"]:
-                await message.reply_video(InputFile(filepath_to_send), caption=caption)
-            else:
-                await message.reply_document(InputFile(filepath_to_send), caption=caption)
-        except Exception:
-            await message.reply_document(InputFile(filepath_to_send), caption=caption)
-    finally:
-        try:
-            if os.path.exists(filepath_to_send):
-                os.remove(filepath_to_send)
-        except Exception:
-            pass
-        try:
-            if os.path.exists(filepath):
-                os.remove(filepath)
-        except Exception:
-            pass
-
-# ---------- Health server ----------
-async def handle_health(request):
+# ------------------- Health Check Server -------------------
+async def health(request):
     return web.Response(text="OK")
 
-async def start_health_server(shutdown_event: asyncio.Event):
+async def start_health_server():
     app = web.Application()
-    app.router.add_get("/", handle_health)
+    app.router.add_get("/", health)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    logger.info(f"Health server listening on 0.0.0.0:{PORT}")
-    await shutdown_event.wait()
-    logger.info("Health server shutting down...")
-    await runner.cleanup()
+    logger.info(f"✅ Health server running on port {PORT}")
+    while True:
+        await asyncio.sleep(3600)
 
-# ---------- Main startup (delete webhook + start polling + health) ----------
+
+# ------------------- Main -------------------
 async def main():
-    # try delete webhook to avoid webhook vs polling conflict
     try:
         await bot.delete_webhook(drop_pending_updates=True)
-        logger.info("delete_webhook called successfully at startup.")
     except Exception as e:
-        logger.warning(f"delete_webhook failed or not supported: {e}")
+        logger.warning(f"Webhook deletion failed: {e}")
 
-    shutdown_event = asyncio.Event()
-    health_task = asyncio.create_task(start_health_server(shutdown_event))
+    asyncio.create_task(start_health_server())
+    logger.info("🚀 Bot started polling...")
+    await dp.start_polling(bot)
 
-    try:
-        logger.info("Starting polling...")
-        await dp.start_polling(bot, skip_updates=True)
-    finally:
-        # stop health server when polling ends
-        shutdown_event.set()
-        await health_task
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        logger.info("Exiting")
+        logger.info("Bot stopped.")
