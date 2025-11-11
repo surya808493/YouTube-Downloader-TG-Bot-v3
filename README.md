@@ -1,26 +1,24 @@
-# YouTube Downloader Telegram Bot (ready)
+YouTube Downloader Telegram Bot — ready
 
-## Requirements
-- Python 3.13 (Dockerfile uses 3.13-slim)
-- ffmpeg (Dockerfile installs it)
-- MongoDB connection (Atlas or self-hosted)
+Requirements:
+- Docker (recommended) or Python 3.12+ locally
+- MongoDB (Atlas or self-hosted)
+- Telegram BOT_TOKEN, OWNER_ID, MONGO_URL in env
 
-## Setup (local)
-1. Copy files into a folder.
-2. Create `.env` from `.env.example`.
-3. Create venv and install:
-   python -m venv venv
-   source venv/bin/activate
-   pip install -r requirements.txt
-4. Run:
-   python main.py
+Local run:
+1. python -m venv venv
+2. source venv/bin/activate
+3. pip install -r requirements.txt
+4. export BOT_TOKEN=...
+   export MONGO_URL=...
+   export OWNER_ID=...
+5. python main.py
 
-## Docker
-Build and run:
-  docker build -t yt-tg-bot .
-  docker run --env-file .env yt-tg-bot
+Docker:
+1. docker build -t yt-tg-bot .
+2. docker run --env-file .env yt-tg-bot
 
-## Notes
-- ffmpeg required for merge/downscale.
-- If running on a managed host, set BOT_TOKEN, MONGO_URL, OWNER_ID in provider env settings.
-- For heavy playlist usage ensure enough disk & CPU.
+Notes:
+- ffmpeg required for merging/downscaling (Dockerfile installs it)
+- Files > 2GB will be auto-downscaled (ffmpeg) if possible
+- For heavy use, ensure sufficient disk & CPU
