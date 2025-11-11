@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-YouTube Video / Shorts / Playlist Downloader Telegram Bot
-- aiogram v3 compatible (Dispatcher without bot in constructor)
-- yt-dlp for downloading
-- motor (Mongo) for user prefs
-- ffmpeg required for downscale/merge (installed in Dockerfile)
-- /setquality, /stats, /broadcast, playlist support, auto-downscale if >2GB
+YouTube Downloader Telegram Bot
+- aiogram v3 compatible
+- Supports: video/short/playlist, per-user quality, auto downscale (>2GB) via ffmpeg
+- Uses yt-dlp and motor (Mongo)
 """
 
 import os
@@ -19,6 +17,7 @@ from dotenv import load_dotenv
 import yt_dlp
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import InputFile, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.filters import Command
 from motor.motor_asyncio import AsyncIOMotorClient
 
 load_dotenv()
@@ -30,11 +29,11 @@ MONGO_URL = os.getenv("MONGO_URL")
 OWNER_ID = int(os.getenv("OWNER_ID") or 0)
 
 if not BOT_TOKEN or not MONGO_URL or not OWNER_ID:
-    logger.error("Please set BOT_TOKEN, MONGO_URL and OWNER_ID in your environment.")
+    logger.error("Please set BOT_TOKEN, MONGO_URL and OWNER_ID in environment.")
     raise SystemExit("Missing environment variables")
 
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()  # aiogram v3: do NOT pass bot into Dispatcher()
+dp = Dispatcher()  # aiogram v3: no bot passed here
 
 mongo = AsyncIOMotorClient(MONGO_URL)
 db = mongo["yt_downloader"]
@@ -108,12 +107,7 @@ def run_ffmpeg_transcode(input_path: str, output_path: str, target_height: int) 
     try:
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
         logger.info(f"ffmpeg exit code: {proc.returncode}")
-        if proc.returncode == 0 and os.path.exists(output_path):
-            return True
-        else:
-            logger.warning(f"ffmpeg failed: returncode={proc.returncode}")
-            logger.debug(proc.stderr.decode(errors="ignore"))
-            return False
+        return proc.returncode == 0 and os.path.exists(output_path)
     except Exception as e:
         logger.exception(f"ffmpeg run error: {e}")
         return False
@@ -168,7 +162,7 @@ async def try_downscale_until_under_limit(original_path: str, title: str, max_by
     return None
 
 # ---------- Handlers ----------
-@dp.message_handler(commands=["start"])
+@dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await add_user(message.from_user.id)
     txt = (
@@ -183,7 +177,7 @@ async def cmd_start(message: types.Message):
     )
     await message.reply(txt, parse_mode="Markdown")
 
-@dp.message_handler(commands=["help"])
+@dp.message(Command("help"))
 async def cmd_help(message: types.Message):
     txt = (
         "📚 *Help*\n\n"
@@ -194,13 +188,13 @@ async def cmd_help(message: types.Message):
     )
     await message.reply(txt, parse_mode="Markdown")
 
-@dp.message_handler(commands=["setquality"])
+@dp.message(Command("setquality"))
 async def cmd_setquality(message: types.Message):
     await add_user(message.from_user.id)
     current = await get_user_quality(message.from_user.id)
     await message.reply(f"Select quality (current: {current})", reply_markup=quality_keyboard())
 
-@dp.callback_query_handler(lambda c: c.data and c.data.startswith("quality_"))
+@dp.callback_query(lambda c: c.data and c.data.startswith("quality_"))
 async def callback_quality(query: types.CallbackQuery):
     user_id = query.from_user.id
     await add_user(user_id)
@@ -209,14 +203,14 @@ async def callback_quality(query: types.CallbackQuery):
     await query.answer(f"Quality set to {quality}", show_alert=False)
     await bot.send_message(user_id, f"✅ Your preferred quality is now *{quality}*", parse_mode="Markdown")
 
-@dp.message_handler(commands=["stats"])
+@dp.message(Command("stats"))
 async def cmd_stats(message: types.Message):
     if message.from_user.id != OWNER_ID:
         return await message.reply("❌ You are not authorized.")
     total = await count_users()
     await message.reply(f"📊 Total users: `{total}`", parse_mode="Markdown")
 
-@dp.message_handler(commands=["broadcast"])
+@dp.message(Command("broadcast"))
 async def cmd_broadcast(message: types.Message):
     if message.from_user.id != OWNER_ID:
         return await message.reply("❌ You are not authorized.")
@@ -236,9 +230,11 @@ async def cmd_broadcast(message: types.Message):
             pass
     await message.reply(f"✅ Broadcast sent to {sent}/{total} users.")
 
-# ---------- Core downloader ----------
-@dp.message_handler(content_types=["text"])
+@dp.message()
 async def handle_text(message: types.Message):
+    if not message.text:
+        return
+
     url = message.text.strip()
     if "youtube.com" not in url and "youtu.be" not in url:
         return await message.reply("❌ Please send a valid YouTube link (video / short / playlist).")
@@ -317,6 +313,7 @@ async def handle_text(message: types.Message):
         logger.exception("Processing error")
         await status.edit_text(f"❌ Error while processing: {e}")
 
+# ---------- send file ----------
 async def process_and_send_file(message: types.Message, filepath: str, info: dict):
     filepath_to_send = filepath
     try:
@@ -371,6 +368,5 @@ async def process_and_send_file(message: types.Message, filepath: str, info: dic
 if __name__ == "__main__":
     logger.info("Starting bot...")
     if not is_ffmpeg_available():
-        logger.warning("ffmpeg not found in PATH. Auto-downscale feature will not work. Install ffmpeg for full functionality.")
-    # aiogram v3: pass bot to start_polling
+        logger.warning("ffmpeg not found in PATH. Auto-downscale feature will not work.")
     asyncio.run(dp.start_polling(bot, skip_updates=True))
