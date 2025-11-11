@@ -1,10 +1,10 @@
-# Use Python 3.12 slim to ensure wheels for native deps (aiohttp) are available
-FROM python:3.12-slim
+# Use Python 3.11 slim to maximize compatibility with native wheels (aiohttp etc.)
+FROM python:3.11-slim
 
 LABEL maintainer="you@example.com"
 ENV PYTHONUNBUFFERED=1
 
-# Install ffmpeg + build tools (needed for some wheels)
+# Install ffmpeg + build tools (needed for some wheels if pip falls back to source)
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
        ffmpeg \
